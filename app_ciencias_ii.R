@@ -1,12 +1,17 @@
-# ============================================================
-# Proyecto Ciencias II
-# Optimización de asignación de salones mediante grafos
-# Técnicas: Matching bipartito + Coloreo de grafos
-# Aplicación Shiny con escenarios modificables
-# ============================================================
-
-# Configurar ruta de biblioteca local para cargar dependencias instaladas en el usuario
+# Proyecto Ciencias II — Asignación de salones con matching bipartito y coloreo de grafos
 .libPaths(c("~/R/library", .libPaths()))
+
+# Captura el directorio del script para guardar datasets junto a él,
+# independientemente del directorio de trabajo activo al ejecutar.
+script_dir <- tryCatch({
+  args     <- commandArgs(trailingOnly = FALSE)
+  file_arg <- Filter(function(x) grepl("--file=", x), args)
+  if (length(file_arg) > 0) {
+    dirname(normalizePath(sub("--file=", "", file_arg[1]), mustWork = FALSE))
+  } else {
+    getwd()
+  }
+}, error = function(e) getwd())
 
 library(shiny)
 library(bslib)
@@ -14,15 +19,16 @@ library(dplyr)
 library(igraph)
 library(DT)
 
-# ============================================================
-# 1. GENERACIÓN DE DATOS SIMULADOS
-# ============================================================
+if (!requireNamespace("visNetwork", quietly = TRUE)) {
+  install.packages("visNetwork", repos = "https://cloud.r-project.org")
+}
+library(visNetwork)
+
+# --- Generación de datos simulados ---
 
 generar_salones <- function(num_salones, tipo_escenario) {
 
-  # Aquí se define el rango de capacidades de los salones según la demanda.
-  # En demanda baja se generan salones más amplios; en demanda alta, salones
-  # con capacidades más ajustadas para que el problema sea más difícil.
+  # Demanda alta → capacidades más ajustadas para hacer el problema más difícil.
   if (tipo_escenario == "Demanda baja") {
     capacidades <- sample(c(35, 40, 45, 50), num_salones, replace = TRUE)
   } else if (tipo_escenario == "Demanda media") {
@@ -31,8 +37,6 @@ generar_salones <- function(num_salones, tipo_escenario) {
     capacidades <- sample(c(20, 25, 30, 35, 40), num_salones, replace = TRUE)
   }
 
-  # Aquí se asigna el tipo de salón. La mayoría son aulas normales y una parte
-  # son laboratorios, porque no todas las clases requieren equipos especiales.
   tipo_salon <- sample(
     c("Aula", "Laboratorio"),
     num_salones,
@@ -40,7 +44,6 @@ generar_salones <- function(num_salones, tipo_escenario) {
     prob = c(0.65, 0.35)
   )
 
-  # Aquí se construye la tabla de salones simulados.
   salones <- data.frame(
     id_salon = paste0("S", 1:num_salones),
     salon = ifelse(
@@ -70,15 +73,12 @@ generar_clases <- function(num_clases, nivel_cruces) {
 
   dias <- c("Lunes", "Martes", "Miércoles", "Jueves", "Viernes")
 
-  # Estos son los bloques horarios que se usarán para simular la programación.
   bloques <- data.frame(
     hora_inicio = c("06:00", "08:00", "10:00", "12:00", "14:00", "16:00", "18:00"),
     hora_fin    = c("08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00"),
     stringsAsFactors = FALSE
   )
 
-  # Aquí se crea la estructura base de la tabla de clases.
-  # Algunos campos se llenan de inmediato y otros se completan según el nivel de cruces.
   clases <- data.frame(
     id_clase = paste0("C", 1:num_clases),
     asignatura = paste(
@@ -102,8 +102,8 @@ generar_clases <- function(num_clases, nivel_cruces) {
 
   if (nivel_cruces == "Sin cruces académicos") {
 
-    # En este caso se busca distribuir las clases en diferentes días, bloques
-    # y semestres para que el grafo usado en el coloreo tenga pocas o ninguna arista.
+    # Distribuye clases en combinaciones únicas de día-bloque-semestre
+    # para que el grafo de coloreo quede sin aristas.
     combinaciones <- expand.grid(
       dia = dias,
       bloque = 1:nrow(bloques),
@@ -125,9 +125,8 @@ generar_clases <- function(num_clases, nivel_cruces) {
 
   } else if (nivel_cruces == "Cruces moderados") {
 
-    # En cruces moderados se fuerza una parte de las clases a compartir
-    # franjas horarias, profesores o semestres. Así se garantiza que el
-    # grafo simple no dirigido tenga algunas aristas visibles.
+    # Cada cuarta clase comparte franja fija para garantizar
+    # al menos algunos conflictos visibles en el grafo.
     for (i in 1:num_clases) {
 
       if (i %% 4 == 0) {
@@ -146,8 +145,8 @@ generar_clases <- function(num_clases, nivel_cruces) {
       }
     }
 
-    # Refuerzo controlado: si hay suficientes clases, se ajustan algunas para
-    # asegurar que el escenario moderado tenga al menos relaciones para coloreo.
+    # Refuerzo controlado para asegurar al menos un par por profesor
+    # y un par por semestre en el escenario moderado.
     if (num_clases >= 4) {
       clases$dia[1:4] <- "Lunes"
       clases$hora_inicio[1:4] <- "08:00"
@@ -158,8 +157,8 @@ generar_clases <- function(num_clases, nivel_cruces) {
 
   } else {
 
-    # En cruces altos se concentran muchas clases en pocas franjas.
-    # Esto produce un grafo más denso y permite evaluar un escenario difícil.
+    # Concentra todas las clases en tres franjas para producir
+    # un grafo denso que evalúe el coloreo bajo alta presión.
     franjas_concentradas <- data.frame(
       dia = c("Lunes", "Lunes", "Martes"),
       hora_inicio = c("08:00", "10:00", "08:00"),
@@ -181,20 +180,15 @@ generar_clases <- function(num_clases, nivel_cruces) {
   return(clases)
 }
 
-# ============================================================
-# 2. FUNCIONES AUXILIARES
-# ============================================================
+# --- Funciones auxiliares ---
 
 hora_a_minutos <- function(hora) {
-  # Convierte una hora como "08:00" a minutos.
-  # Esto facilita comparar intervalos horarios.
   partes <- strsplit(hora, ":")[[1]]
   as.numeric(partes[1]) * 60 + as.numeric(partes[2])
 }
 
 hay_cruce_horario <- function(inicio1, fin1, inicio2, fin2) {
-  # Dos intervalos se cruzan si el inicio del primero ocurre antes del fin
-  # del segundo y el inicio del segundo ocurre antes del fin del primero.
+  # Dos intervalos [a,b) y [c,d) se solapan si y solo si a < d && c < b.
   i1 <- hora_a_minutos(inicio1)
   f1 <- hora_a_minutos(fin1)
   i2 <- hora_a_minutos(inicio2)
@@ -205,20 +199,18 @@ hay_cruce_horario <- function(inicio1, fin1, inicio2, fin2) {
 
 crear_recursos <- function(clases, salones) {
 
-  # Aquí se toman los bloques horarios existentes en las clases.
   bloques <- clases %>%
     select(dia, hora_inicio, hora_fin) %>%
     distinct()
 
-  # Se hace un producto cartesiano entre salones y bloques.
-  # Así cada recurso queda definido como: salón + día + hora.
+  # Producto cartesiano salones × bloques: cada recurso es
+  # una combinación única de salón + día + hora.
   salones$key <- 1
   bloques$key <- 1
 
   recursos <- merge(salones, bloques, by = "key") %>%
     select(-key)
 
-  # Identificador único del recurso.
   recursos$id_recurso <- paste(
     recursos$id_salon,
     recursos$dia,
@@ -227,7 +219,6 @@ crear_recursos <- function(clases, salones) {
     sep = "_"
   )
 
-  # Nombre legible para mostrar en el grafo.
   recursos$nombre_recurso <- paste0(
     recursos$salon, "\n",
     recursos$dia, "\n",
@@ -237,22 +228,16 @@ crear_recursos <- function(clases, salones) {
   return(recursos)
 }
 
-# ============================================================
-# 3. GRAFO BIPARTITO Y MATCHING
-# ============================================================
+# --- Grafo bipartito y matching ---
 
 crear_aristas_compatibilidad <- function(clases, recursos, usar_capacidad, usar_tipo) {
 
-  # En esta tabla se guardan las aristas del grafo bipartito.
-  # from será una clase y to será un recurso.
   aristas <- data.frame(
     from = character(),
     to = character(),
     stringsAsFactors = FALSE
   )
 
-  # Aquí se recorre cada clase contra cada recurso.
-  # Si se cumplen las restricciones, se agrega una arista.
   for (i in 1:nrow(clases)) {
     for (j in 1:nrow(recursos)) {
 
@@ -263,19 +248,14 @@ crear_aristas_compatibilidad <- function(clases, recursos, usar_capacidad, usar_
       capacidad_ok <- TRUE
       tipo_ok <- TRUE
 
-      # Si la restricción de capacidad está activada,
-      # el salón debe tener cupo suficiente para la clase.
       if (usar_capacidad) {
         capacidad_ok <- recursos$capacidad[j] >= clases$estudiantes[i]
       }
 
-      # Si la restricción de tipo está activada,
-      # un laboratorio solo se asigna cuando la clase lo requiere, y viceversa.
       if (usar_tipo) {
         tipo_ok <- recursos$tipo_salon[j] == clases$tipo_requerido[i]
       }
 
-      # Si todo se cumple, se crea la conexión clase-recurso.
       if (misma_franja && capacidad_ok && tipo_ok) {
         aristas <- rbind(
           aristas,
@@ -297,21 +277,18 @@ matching_bipartito <- function(clases, recursos, aristas) {
   ids_clases <- clases$id_clase
   ids_recursos <- recursos$id_recurso
 
-  # Aquí se construye la lista de adyacencia.
-  # Para cada clase se guarda la lista de recursos compatibles.
   adyacencia <- lapply(ids_clases, function(clase) {
     aristas$to[aristas$from == clase]
   })
 
   names(adyacencia) <- ids_clases
 
-  # match_recurso indica qué clase tiene asignado cada recurso.
-  # NA significa que el recurso aún está libre.
+  # NA indica que el recurso está disponible.
   match_recurso <- rep(NA, length(ids_recursos))
   names(match_recurso) <- ids_recursos
 
-  # Esta función intenta encontrar un camino aumentante.
-  # Si un recurso está ocupado, se intenta reubicar la clase que lo ocupa.
+  # Búsqueda de camino aumentante: si un recurso está ocupado,
+  # intenta reubicar la clase asignada antes de rechazar la actual.
   buscar_camino <- function(clase, visitados) {
 
     for (recurso in adyacencia[[clase]]) {
@@ -332,14 +309,12 @@ matching_bipartito <- function(clases, recursos, aristas) {
     return(FALSE)
   }
 
-  # Se intenta asignar cada clase.
   for (clase in ids_clases) {
     visitados <- rep(FALSE, length(ids_recursos))
     names(visitados) <- ids_recursos
     buscar_camino(clase, visitados)
   }
 
-  # Se transforma el resultado del matching en una tabla.
   asignaciones <- data.frame(
     id_recurso = names(match_recurso),
     id_clase = as.character(match_recurso),
@@ -373,14 +348,10 @@ matching_bipartito <- function(clases, recursos, aristas) {
   return(resultado)
 }
 
-# ============================================================
-# 4. GRAFO SIMPLE NO DIRIGIDO PARA COLOREO
-# ============================================================
+# --- Grafo simple no dirigido para coloreo ---
 
 crear_aristas_coloreo <- function(clases, usar_profesor, usar_semestre) {
 
-  # Aquí se guardan las aristas del grafo simple no dirigido.
-  # Una arista indica que dos clases deben quedar con colores diferentes.
   aristas_coloreo <- data.frame(
     from = character(),
     to = character(),
@@ -392,7 +363,6 @@ crear_aristas_coloreo <- function(clases, usar_profesor, usar_semestre) {
     return(aristas_coloreo)
   }
 
-  # Se comparan todas las parejas de clases.
   for (i in 1:(nrow(clases) - 1)) {
     for (j in (i + 1):nrow(clases)) {
 
@@ -408,8 +378,8 @@ crear_aristas_coloreo <- function(clases, usar_profesor, usar_semestre) {
       mismo_profesor <- usar_profesor && clases$profesor[i] == clases$profesor[j]
       mismo_semestre <- usar_semestre && clases$semestre[i] == clases$semestre[j]
 
-      # Solo se agrega arista si las clases coinciden en día, se cruzan
-      # en horario y comparten profesor o semestre.
+      # Solo hay conflicto si se cruzan en horario Y comparten
+      # profesor o semestre (criterio académico, no solo temporal).
       if (mismo_dia && cruce && (mismo_profesor || mismo_semestre)) {
 
         criterio <- ifelse(
@@ -436,14 +406,14 @@ crear_aristas_coloreo <- function(clases, usar_profesor, usar_semestre) {
 
 crear_grafo_coloreo <- function(clases, aristas_coloreo) {
 
-  # Cada clase es un vértice del grafo simple no dirigido.
   vertices <- data.frame(
     name = clases$id_clase,
     label = paste0(clases$id_clase, "\n", clases$asignatura),
     stringsAsFactors = FALSE
   )
 
-  # Si no hay aristas, se crea un grafo con vértices aislados.
+  # Sin aristas el grafo sigue necesitando todos los vértices
+  # para que el coloreo asigne color 1 a todas las clases.
   if (nrow(aristas_coloreo) == 0) {
     aristas_vacias <- data.frame(
       from = character(),
@@ -473,8 +443,8 @@ coloreo_greedy <- function(grafo) {
   colores <- rep(NA, length(nodos))
   names(colores) <- nodos
 
-  # Se ordenan los vértices por grado descendente.
-  # Primero se colorean los vértices con más conexiones.
+  # Orden descendente por grado: los vértices más conectados
+  # se colorean primero para minimizar el número de colores usados.
   grados <- degree(grafo)
   orden <- names(sort(grados, decreasing = TRUE))
 
@@ -485,8 +455,6 @@ coloreo_greedy <- function(grafo) {
     colores_vecinos <- colores[nombres_vecinos]
     colores_usados <- colores_vecinos[!is.na(colores_vecinos)]
 
-    # Se busca el primer color disponible que no haya sido usado
-    # por sus vecinos.
     color <- 1
 
     while (color %in% colores_usados) {
@@ -499,9 +467,7 @@ coloreo_greedy <- function(grafo) {
   return(colores)
 }
 
-# ============================================================
-# 5. INTERFAZ SHINY
-# ============================================================
+# --- Interfaz Shiny ---
 
 ui <- page_sidebar(
 
@@ -766,7 +732,7 @@ ui <- page_sidebar(
           inline = TRUE
         ),
 
-        plotOutput("grafo_bipartito", height = "760px", width = "100%")
+        visNetworkOutput("grafo_bipartito", height = "700px", width = "100%")
       )
     ),
 
@@ -790,7 +756,7 @@ ui <- page_sidebar(
 
             br(), br(),
 
-            plotOutput("grafo_coloreo", height = "760px", width = "100%")
+            visNetworkOutput("grafo_coloreo", height = "600px", width = "100%")
           )
         ),
 
@@ -847,9 +813,7 @@ ui <- page_sidebar(
   )
 )
 
-# ============================================================
-# 6. SERVIDOR
-# ============================================================
+# --- Servidor ---
 
 server <- function(input, output, session) {
 
@@ -861,7 +825,6 @@ server <- function(input, output, session) {
 
   observeEvent(input$generar, {
 
-    # Validaciones para evitar valores negativos o vacíos.
     if (is.na(input$semilla) || input$semilla < 1) {
       showNotification(
         "La semilla debe ser un número mayor o igual a 1.",
@@ -930,6 +893,13 @@ server <- function(input, output, session) {
       num_salones = num_salones,
       tipo_escenario = input$tipo_escenario
     )
+
+    tryCatch({
+      datasets_dir <- file.path(script_dir, "datasets")
+      dir.create(datasets_dir, showWarnings = FALSE, recursive = TRUE)
+      write.csv(datos$clases,  file.path(datasets_dir, "dataset_clases_simuladas.csv"),  row.names = FALSE)
+      write.csv(datos$salones, file.path(datasets_dir, "dataset_salones_simulados.csv"), row.names = FALSE)
+    }, error = function(e) NULL)
 
     datos$resultados <- NULL
 
@@ -1067,216 +1037,169 @@ server <- function(input, output, session) {
     metricas_reactivas()
   })
 
-  output$grafo_bipartito <- renderPlot({
+  output$grafo_bipartito <- renderVisNetwork({
 
     req(datos$resultados)
-    par(mar = c(1, 1, 3, 1))
 
-    clases <- datos$clases
-    recursos <- datos$resultados$recursos
-    aristas <- datos$resultados$aristas
+    clases     <- datos$clases
+    recursos   <- datos$resultados$recursos
+    aristas    <- datos$resultados$aristas
     asignacion <- datos$resultados$asignacion
 
     if (input$tipo_grafo_bipartito == "Asignación final") {
 
-      aristas_finales <- asignacion %>%
+      aristas_vis <- asignacion %>%
         filter(estado == "Asignada") %>%
         select(from = id_clase, to = id_recurso)
 
-      if (nrow(aristas_finales) == 0) {
-        plot.new()
-        text(0.5, 0.55, "No hay clases asignadas para mostrar.", cex = 1.2)
-        text(0.5, 0.45, "Desactivar alguna restricción o aumentar salones.", cex = 0.9)
-        return()
+      if (nrow(aristas_vis) == 0) {
+        return(visNetwork(
+          nodes = data.frame(id = 1, label = "Sin asignaciones. Desactivar restricciones o aumentar salones.", shape = "text"),
+          edges = data.frame(from = integer(), to = integer())
+        ))
       }
 
-      vertices_clases <- clases %>%
-        filter(id_clase %in% aristas_finales$from) %>%
-        transmute(
-          name = id_clase,
-          label = paste0(id_clase, "\n", asignatura),
-          tipo = "Clase"
-        )
-
-      vertices_recursos <- recursos %>%
-        filter(id_recurso %in% aristas_finales$to) %>%
-        transmute(
-          name = id_recurso,
-          label = nombre_recurso,
-          tipo = "Recurso"
-        )
-
-      vertices <- rbind(vertices_clases, vertices_recursos)
-
-      grafo <- graph_from_data_frame(
-        d = aristas_finales,
-        vertices = vertices,
-        directed = FALSE
-      )
-
-      titulo <- "Matching bipartito: asignación final"
+      clases_vis   <- clases %>% filter(id_clase %in% aristas_vis$from)
+      recursos_vis <- recursos %>% filter(id_recurso %in% aristas_vis$to)
+      edge_color   <- "#2C3E50"
+      edge_width   <- 2.5
 
     } else {
 
       if (nrow(aristas) == 0) {
-        plot.new()
-        text(0.5, 0.55, "No hay compatibilidades con las restricciones actuales.", cex = 1.2)
-        text(0.5, 0.45, "Desactivar capacidad o tipo de salón.", cex = 0.9)
-        return()
+        return(visNetwork(
+          nodes = data.frame(id = 1, label = "Sin compatibilidades. Desactivar restricciones de capacidad o tipo.", shape = "text"),
+          edges = data.frame(from = integer(), to = integer())
+        ))
       }
 
-      vertices_clases <- data.frame(
-        name = clases$id_clase,
-        label = paste0(clases$id_clase, "\n", clases$asignatura),
-        tipo = "Clase",
-        stringsAsFactors = FALSE
-      )
-
-      vertices_recursos <- data.frame(
-        name = recursos$id_recurso,
-        label = recursos$nombre_recurso,
-        tipo = "Recurso",
-        stringsAsFactors = FALSE
-      )
-
-      vertices <- rbind(vertices_clases, vertices_recursos)
-
-      grafo <- graph_from_data_frame(
-        d = aristas,
-        vertices = vertices,
-        directed = FALSE
-      )
-
-      titulo <- "Grafo bipartito: compatibilidades posibles"
+      clases_vis   <- clases %>% filter(id_clase %in% aristas$from)
+      recursos_vis <- recursos %>% filter(id_recurso %in% aristas$to)
+      aristas_vis  <- aristas
+      edge_color   <- "#aaaaaa"
+      edge_width   <- 0.8
     }
 
-    vertices_grafo <- data.frame(
-      name = V(grafo)$name,
-      tipo = V(grafo)$tipo,
-      label = V(grafo)$label,
+    n_c <- nrow(clases_vis)
+    n_r <- nrow(recursos_vis)
+
+    nodes_clases <- data.frame(
+      id    = clases_vis$id_clase,
+      label = clases_vis$id_clase,
+      title = paste0(
+        "<b>", clases_vis$id_clase, "</b><br>",
+        clases_vis$asignatura, "<br>",
+        "Estudiantes: ", clases_vis$estudiantes, "<br>",
+        "Tipo requerido: ", clases_vis$tipo_requerido, "<br>",
+        "Profesor: ", clases_vis$profesor, "<br>",
+        "Semestre: ", clases_vis$semestre, "<br>",
+        clases_vis$dia, " ", clases_vis$hora_inicio, "–", clases_vis$hora_fin
+      ),
+      group = "Clase",
+      x     = rep(-400, n_c),
+      y     = seq(-n_c * 60, n_c * 60, length.out = n_c),
       stringsAsFactors = FALSE
     )
 
-    clases_grafo <- vertices_grafo %>% filter(tipo == "Clase")
-    recursos_grafo <- vertices_grafo %>% filter(tipo == "Recurso")
-
-    layout <- matrix(0, nrow = vcount(grafo), ncol = 2)
-
-    for (i in 1:vcount(grafo)) {
-      if (V(grafo)$tipo[i] == "Clase") {
-        layout[i, 1] <- 0
-        layout[i, 2] <- -which(clases_grafo$name == V(grafo)$name[i])
-      } else {
-        layout[i, 1] <- 2.2
-        layout[i, 2] <- -which(recursos_grafo$name == V(grafo)$name[i])
-      }
-    }
-
-    V(grafo)$color <- ifelse(V(grafo)$tipo == "Clase", "#5DADE2", "#58D68D")
-    V(grafo)$size <- ifelse(V(grafo)$tipo == "Clase", 24, 20)
-
-    E(grafo)$color <- ifelse(
-      input$tipo_grafo_bipartito == "Asignación final",
-      "#2C3E50",
-      "gray70"
-    )
-
-    E(grafo)$width <- ifelse(
-      input$tipo_grafo_bipartito == "Asignación final",
-      2.8,
-      0.8
-    )
-
-    plot(
-      grafo,
-      layout = layout,
-      vertex.size = V(grafo)$size,
-      vertex.color = V(grafo)$color,
-      vertex.label = V(grafo)$label,
-      vertex.label.cex = ifelse(
-        input$tipo_grafo_bipartito == "Asignación final",
-        0.75,
-        0.43
+    nodes_recursos <- data.frame(
+      id    = recursos_vis$id_recurso,
+      label = recursos_vis$salon,
+      title = paste0(
+        "<b>", recursos_vis$salon, "</b><br>",
+        recursos_vis$dia, " ", recursos_vis$hora_inicio, "–", recursos_vis$hora_fin, "<br>",
+        "Capacidad: ", recursos_vis$capacidad, "<br>",
+        "Tipo: ", recursos_vis$tipo_salon
       ),
-      vertex.label.color = "black",
-      edge.color = E(grafo)$color,
-      edge.width = E(grafo)$width,
-      main = titulo,
-      margin = 0.1
+      group = "Recurso",
+      x     = rep(400, n_r),
+      y     = seq(-n_r * 60, n_r * 60, length.out = n_r),
+      stringsAsFactors = FALSE
     )
 
-    legend(
-      "topright",
-      legend = c("Clase", "Recurso"),
-      col = c("#5DADE2", "#58D68D"),
-      pch = 19,
-      pt.cex = 2,
-      bty = "n"
+    nodes <- rbind(nodes_clases, nodes_recursos)
+    edges <- data.frame(
+      from  = aristas_vis$from,
+      to    = aristas_vis$to,
+      color = edge_color,
+      width = edge_width,
+      stringsAsFactors = FALSE
     )
+
+    visNetwork(nodes, edges) %>%
+      visGroups(groupname = "Clase",
+                color = list(background = "#5DADE2", border = "#2980B9"),
+                shape = "ellipse") %>%
+      visGroups(groupname = "Recurso",
+                color = list(background = "#58D68D", border = "#27AE60"),
+                shape = "box") %>%
+      visPhysics(enabled = FALSE) %>%
+      visOptions(highlightNearest = list(enabled = TRUE, degree = 1, hover = TRUE)) %>%
+      visLegend(position = "right", main = "Leyenda") %>%
+      visInteraction(zoomView = TRUE, dragView = TRUE)
   })
 
-  dibujar_grafo_coloreo <- function() {
-
+  grafo_coloreo_vis <- reactive({
     req(datos$resultados)
-    par(mar = c(1, 1, 3, 1))
 
-    grafo <- datos$resultados$grafo_coloreo
-    colores <- datos$resultados$colores
-
-    if (ecount(grafo) == 0) {
-      plot.new()
-      text(
-        0.5, 0.56,
-        "No hay aristas para coloreo con los criterios actuales.",
-        cex = 1.15
-      )
-      text(
-        0.5, 0.45,
-        "Seleccionar cruces moderados/altos o activar profesor/semestre.",
-        cex = 0.9,
-        col = "gray40"
-      )
-      return()
-    }
+    clases          <- datos$clases
+    colores         <- datos$resultados$colores
+    aristas_coloreo <- datos$resultados$aristas_coloreo
 
     num_colores <- max(colores, na.rm = TRUE)
-    paleta <- hcl.colors(num_colores, "Set 3")
+    paleta      <- hcl.colors(num_colores, "Set 3")
 
-    V(grafo)$color <- paleta[colores[V(grafo)$name]]
-    V(grafo)$label <- V(grafo)$name
+    idx <- match(names(colores), clases$id_clase)
 
-    E(grafo)$color <- "gray30"
-    E(grafo)$width <- 2.2
-
-    set.seed(123)
-
-    plot(
-      grafo,
-      layout = layout_with_fr(grafo),
-      vertex.size = 38,
-      vertex.color = V(grafo)$color,
-      vertex.label = V(grafo)$label,
-      vertex.label.cex = 1,
-      vertex.label.color = "black",
-      edge.color = E(grafo)$color,
-      edge.width = E(grafo)$width,
-      main = "Grafo simple no dirigido con coloreo greedy",
-      margin = 0.1
+    nodes <- data.frame(
+      id    = names(colores),
+      label = names(colores),
+      title = paste0(
+        "<b>", names(colores), "</b><br>",
+        clases$asignatura[idx], "<br>",
+        "Profesor: ", clases$profesor[idx], "<br>",
+        "Semestre: ", clases$semestre[idx], "<br>",
+        clases$dia[idx], " ", clases$hora_inicio[idx], "–", clases$hora_fin[idx], "<br>",
+        "Color asignado: ", colores
+      ),
+      color = paleta[colores],
+      size  = 20,
+      group = paste("Color", colores),
+      stringsAsFactors = FALSE
     )
 
-    legend(
-      "topright",
-      legend = paste("Color", 1:num_colores),
-      col = paleta,
-      pch = 19,
-      pt.cex = 1.4,
-      bty = "n"
-    )
+    edges <- if (nrow(aristas_coloreo) > 0) {
+      data.frame(
+        from  = aristas_coloreo$from,
+        to    = aristas_coloreo$to,
+        color = "#666666",
+        width = 2,
+        stringsAsFactors = FALSE
+      )
+    } else {
+      data.frame(from = character(), to = character(),
+                 color = character(), width = numeric(),
+                 stringsAsFactors = FALSE)
+    }
+
+    list(nodes = nodes, edges = edges, num_colores = num_colores, paleta = paleta)
+  })
+
+  construir_vis_coloreo <- function(d) {
+    net <- visNetwork(d$nodes, d$edges) %>%
+      visPhysics(solver = "forceAtlas2Based", stabilization = TRUE) %>%
+      visOptions(highlightNearest = list(enabled = TRUE, degree = 1, hover = TRUE)) %>%
+      visInteraction(zoomView = TRUE, dragView = TRUE)
+
+    for (i in seq_len(d$num_colores)) {
+      net <- net %>% visGroups(groupname = paste("Color", i), color = d$paleta[i])
+    }
+
+    net %>% visLegend(position = "right", main = "Colores")
   }
 
-  output$grafo_coloreo <- renderPlot({
-    dibujar_grafo_coloreo()
-  }, height = 900, width = 1200)
+  output$grafo_coloreo <- renderVisNetwork({
+    construir_vis_coloreo(grafo_coloreo_vis())
+  })
 
   observeEvent(input$ver_grafo_coloreo_grande, {
 
@@ -1284,10 +1207,10 @@ server <- function(input, output, session) {
       modalDialog(
         title = "Grafo simple no dirigido con coloreo greedy",
 
-        plotOutput(
+        visNetworkOutput(
           "grafo_coloreo_modal",
-          height = "850px",
-          width = "100%"
+          height = "750px",
+          width  = "100%"
         ),
 
         easyClose = TRUE,
@@ -1297,9 +1220,9 @@ server <- function(input, output, session) {
     )
   })
 
-  output$grafo_coloreo_modal <- renderPlot({
-    dibujar_grafo_coloreo()
-  }, height = 850, width = 1300)
+  output$grafo_coloreo_modal <- renderVisNetwork({
+    construir_vis_coloreo(grafo_coloreo_vis())
+  })
 
   output$tabla_aristas_coloreo <- renderDT({
 
@@ -1372,8 +1295,6 @@ server <- function(input, output, session) {
   })
 }
 
-# ============================================================
-# 7. EJECUTAR APLICACIÓN
-# ============================================================
+# --- Ejecutar aplicación ---
 
 shinyApp(ui = ui, server = server)
